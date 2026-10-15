@@ -1,6 +1,7 @@
 import React from 'react';
 
-const Settings = ({onUpdateModel, currentModelSize, availableMemory, transcriptionModels, onUpdateLanguage, currentLanguage, onUpdateTranscribeAndShutdown, currentTranscribeAndShutdown}) => {
+const Settings = ({onUpdateModel, currentModelSize, availableMemory, transcriptionModels, onUpdateLanguage, currentLanguage,
+    resourceProfiles, resourceProfile, onUpdateResourceProfile}) => {
     // Function to handle model change
     const handleModelChange = (event) => {
         onUpdateModel(event.target.value);
@@ -11,33 +12,20 @@ const Settings = ({onUpdateModel, currentModelSize, availableMemory, transcripti
         onUpdateLanguage(event.target.value);
     };
 
-    // Function to handle shutdown change
-    const handleTranscribeAndShutdown = (event) => {
-        onUpdateTranscribeAndShutdown(event.target.checked);
-    }
-
     return (
         <div>
             <h2 style={{ marginBottom: '1.5rem', fontFamily: 'Outfit' }}>Settings</h2>
-
-            {/* Section for setting transcribe and shutdown mode */}
             <div className="setting-group">
-                <h3>Transcribe and stop</h3>
-                <div className="toggle-container">
-                    <label className="toggle-switch" htmlFor="shutdown-toggle">
-                        <input
-                            type="checkbox"
-                            id="shutdown-toggle"
-                            checked={currentTranscribeAndShutdown}
-                            onChange={handleTranscribeAndShutdown}
-                        />
-                        <span className="slider"></span>
-                    </label>
-                    <span className="toggle-label">Stop UCloud job after transcription completes</span>
+                <h3>Compute resources</h3>
+                <div className="select-box">
+                    <select aria-label="Compute resources" value={resourceProfile}
+                        onChange={event => onUpdateResourceProfile(event.target.value)}>
+                        {Object.entries(resourceProfiles ?? {}).map(([identifier, profile]) => (
+                            <option key={identifier} value={identifier}>{profile.label ?? identifier}</option>
+                        ))}
+                    </select>
                 </div>
             </div>
-
-            <div style={{ borderBottom: '1px solid var(--border-color)', margin: '1.5rem 0' }}></div>
 
             {/* Section for setting a model */}
             <div className="setting-group">

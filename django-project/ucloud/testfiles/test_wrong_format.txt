@@ -1,2 +1,0 @@
-This is a test file for simulation of scanning for files in UCLoud mounted folder.
-This file should be rejected because of wrong type.

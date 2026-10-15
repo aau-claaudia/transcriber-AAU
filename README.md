@@ -1,90 +1,113 @@
-# Transcriber-gui
-Graphical User Interface for the transcriber application. The GUI is built using React, Django and Celery.
-The application uses a task manager in the backend for the long-running transcription task. This way there will not be long-running http requests, which would break during attempted user reloading of the page.
-The following figure shows a sequence diagram of the interaction.
+# Transcriber-AAU
 
-![Sequence Diagram](documentation/sequence-diagram.svg)
+### Slurm result layout
+
+The Slurm runner publishes one flat directory per recording under `MEDIA_ROOT`:
+
+```text
+Interview_base_auto/
+  data/
+    Interview.wav
+    edited_output.json
+    metadata.json
+  TRANSCRIPTIONS/
+    Interview_base_en.aud
+    Interview_base_en.csv
+    ...remaining original worker outputs...
+    files.zip
+    transcribe.log
+    transcriber_output.txt
+```
+
+Directory names use `<input stem>_<model>_<requested language>`, adding `_run2`,
+`_run3`, etc. when a previous result exists. Original worker filenames and contents
+are preserved, including detected-language suffixes and Parakeet's language-free
+filenames. Only the separate `data/edited_output.json` copy receives editor IDs.
+Inputs in a batch must have distinct stems, including across different extensions.
+
+The normal output set contains nine standard formats and five merged formats,
+plus the ZIP and two logs (17 downloadable files). A worker run without merged
+outputs is accepted for languages without diarization support; a partially present
+merged set is rejected. The worker ZIP and logs describe the whole batch and are
+copied into each recording's result directory.
+
+All recordings are prepared in hidden staging before publication. Each complete
+recording becomes visible independently when its directory is renamed into place.
+The batch completion manifest stays in `JOBS_ROOT/<UUID>/completion.json` and is
+written only after all recordings are published. Publication errors roll back the
+directories created by that attempt; an abrupt process kill can leave complete
+recording directories without a batch completion manifest. Existing results are
+never overwritten. This layout replaces the previous UUID-based result layout;
+there is no compatibility reader for that development format.
 
 ### Setting up the environment for development
 
-To run the development React server you need to install node (v24) and npm
 
+Build transcriber docker image
 ``` bash
-sudo apt install node npm python3-django
-```
-
-Create a Python environment for your project, go to the transcriber-gui directory and create it
-
-``` bash
-python3 -m venv .venv
-```
-and activate it
-``` bash
-source .venv/bin/activate
-```
-Now install the needed python libraries
-``` bash
-pip install django django-cors-headers celery redis python-dotenv torch python-docx pytest
+export HF_TOKEN='your-token'
+docker buildx build \
+  --load \
+  --secret id=hf_token,env=HF_TOKEN \
+  --build-arg TRANSCRIBER_VERSION=1.22 \
+  -f worker-image/Dockerfile \
+  -t transcriber-sif:1.22 \
+  .
 ```
 
-Create the folders for managing file uploads and output
+Build sif image with apptainer
 ``` bash
-cd transcriber-gui/django-project
-mkdir media
-cd media
-mkdir uploads
+../apptainer/bin/apptainer build transcriber-sif_1.22.sif docker-daemon://transcriber-sif:1.22
 ```
 
-Prepare and start the Django backend.
-Firstly create an environment file for test in the "transcriber-gui/django-project" directory called ".env" with the following content
-MEMORY_IN_GIGS is used for determining the usable whisper models.
-```
-SECRET_KEY='django-insecure-wr3t_w3m5qmgzn(4&f*5uhq*kqd^f21eu!p84jl0dw!8y*=e=^'
-DEBUG=True
-DJANGO_LOG_HANDLER='console'
-DJANGO_LOG_LEVEL='DEBUG'
-DJANGO_LOG_FILE='/home/nikko/projects/transcriber-gui/django.log'
-MEMORY_IN_GIGS=64
-PROD=False
-```
-Next prepare the database and start the django development server
+Copy docker image to HPC cluster
 ``` bash
-cd django-project
-python manage.py makemigrations transcriber
-python manage.py migrate
-python manage.py runserver
+docker cp \
+  "$PWD/worker-image/transcriber-sif_1.22.sif" \
+  ondemand:/home/hpcadmin/containers/transcriber-sif_1.22.sif
+
+docker exec ondemand chown 1001:1001 \
+  /home/hpcadmin/containers/transcriber-sif_1.22.sif
+
+docker exec ondemand chmod 0644 \
+  /home/hpcadmin/containers/transcriber-sif_1.22.sif
 ```
 
-In a new terminal start a celery worker (for consuming transcription tasks)
+Create apparmor profile
 ``` bash
-cd transcriber-gui
-source .venv/bin/activate
-cd django-project
-python -m celery -A django-project worker -l info --concurrency=1
+sudoedit /etc/apparmor.d/hpcts-apptainer
 ```
 
-Checkout and install the transcriber Python application
+Use:
+profile hpcts-apptainer flags=(unconfined) {
+    userns,
+}
+
+Load into kernel:
 ``` bash
-cd transcriber
-git clone --depth 1 --single-branch --recursive --shallow-submodules -b "V1.22" https://github.com/aau-claaudia/transcriber.git aau-whisper
-cd aau-whisper
-pip install -e .
+sudo apparmor_parser --replace \
+  /etc/apparmor.d/hpcts-apptainer
 ```
 
-We also need to install the required npm packages
+apply to service in yaml file:
+services:
+  cpn01:
+    security_opt:
+      - apparmor=hpcts-apptainer
+
+reload service:
 ``` bash
-cd transcriber-gui/django-project/frontend
-npm install
+docker compose \
+  -f docker-compose.yml \
+  -f docker-compose.apptainer.yml \
+  up -d --no-deps --force-recreate cpn01
 ```
 
-In a new terminal start the Vite development server
+Once no container uses the custom profile, unload it
 ``` bash
-cd transcriber-gui/django-project/frontend/
-npm run dev
+sudo apparmor_parser --remove /etc/apparmor.d/hpcts-apptainer
 ```
 
-Run tests
-``` bash
-(.venv) nikko@nikkoAtClaaudia:~/projects/transcriber-gui$ pytest -v --ignore=django-project/transcriber/aau-whisper/
-```
 
+Example deploy changed UI files:
+docker cp /home/nikko/projects/openondemand/hpc-toolset-tutorial/transcriber-AAU/django-project/django-project/settings.py ondemand:/home/hpcadmin/ondemand/dev/transcriber/django-project/settings.py && docker cp /home/nikko/projects/openondemand/hpc-toolset-tutorial/transcriber-AAU/django-project/transcriber/views.py ondemand:/home/hpcadmin/ondemand/dev/transcriber/transcriber/views.py && docker cp /home/nikko/projects/openondemand/hpc-toolset-tutorial/transcriber-AAU/django-project/frontend/build/. ondemand:/home/hpcadmin/ondemand/dev/transcriber/frontend/build/ && docker exec ondemand chown -R 1001:1001 /home/hpcadmin/ondemand/dev/transcriber/frontend/build && docker exec --user 1001:1001 --env HOME=/home/hpcadmin --workdir /home/hpcadmin/ondemand/dev/transcriber ondemand .venv/bin/python manage.py collectstatic --noinput && docker exec --user 1001:1001 ondemand touch /home/hpcadmin/ondemand/dev/transcriber/tmp/restart.txt

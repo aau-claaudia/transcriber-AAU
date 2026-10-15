@@ -1,3 +1,4 @@
+import { apiFetch as fetch } from './api.js';
 import React, { useState, useEffect } from 'react';
 
 const EditPage = ({ transcriptionKey, transcriptionData, onBack, onOpenNotes, onServerError}) => {
@@ -116,7 +117,6 @@ const EditPage = ({ transcriptionKey, transcriptionData, onBack, onOpenNotes, on
                                             href={file.file_url}
                                             className="download-btn-card"
                                             title={getTitleForFileExtension(ext)}
-                                            download
                                             rel="noreferrer"
                                         >
                                             <span className="ext-badge">{ext}</span>
@@ -140,7 +140,6 @@ const EditPage = ({ transcriptionKey, transcriptionData, onBack, onOpenNotes, on
                                             href={file.file_url}
                                             className="download-btn-card"
                                             title={getTitleForFileExtension(ext)}
-                                            download
                                             rel="noreferrer"
                                         >
                                             <span className="ext-badge">{ext}</span>
@@ -164,7 +163,7 @@ const EditPage = ({ transcriptionKey, transcriptionData, onBack, onOpenNotes, on
                             <h4 style={{ marginBottom: '0.5rem' }}>📦 Entire Output Archive</h4>
                             <p style={{ fontSize: '0.85rem', marginBottom: '0.75rem' }}>Download a zip archive containing all
                                 format outputs for this transcription.</p>
-                            <a href={zipFile.file_url} className="btn btn-secondary" download>
+                            <a href={zipFile.file_url} className="btn btn-secondary">
                                 Download Zip File
                             </a>
                         </div>
@@ -185,7 +184,7 @@ const EditPage = ({ transcriptionKey, transcriptionData, onBack, onOpenNotes, on
                                     <a
                                         style={{ marginRight: '1rem' }}
                                         key={idx}
-                                        href={file.file_url} className="btn btn-secondary" download>
+                                        href={file.file_url} className="btn btn-secondary">
                                         {file.file_name}
                                     </a>
                                 );

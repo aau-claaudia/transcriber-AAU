@@ -1,0 +1,2 @@
+-r requirements-web.txt
+pysqlite3-binary>=0.5,<0.6; sys_platform == "linux"

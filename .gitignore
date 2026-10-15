@@ -1,5 +1,11 @@
 # Python virtual environment
 .venv
+django-project/.venv/
+__pycache__/
+*.py[cod]
+*.sqlite3
+.pytest_cache/
+django-project/frontend/build/
 # Logs
 logs
 *.log

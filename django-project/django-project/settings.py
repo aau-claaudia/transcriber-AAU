@@ -12,8 +12,16 @@ https://docs.djangoproject.com/en/5.1/ref/settings/
 
 from pathlib import Path
 from dotenv import load_dotenv
+load_dotenv(Path.home() / '.config/transcriber-aau/ondemand.env', override=False)
 load_dotenv()
 import os
+import json
+import hashlib
+import sys
+if os.environ.get('TRANSCRIBER_BUNDLED_SQLITE') == 'True':
+    import pysqlite3
+    sys.modules['sqlite3'] = pysqlite3
+from transcriber.private_storage import initialize_storage
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -22,14 +30,40 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/5.1/howto/deployment/checklist/
 
-ALLOWED_HOSTS = ['*']
-
-SECRET_KEY = os.environ.get('SECRET_KEY')
 DEBUG = os.environ.get('DEBUG') == 'True'
 PROD = os.environ.get('PROD') == 'True'
+APP_PREFIX = os.environ.get('TRANSCRIBER_APP_PREFIX', '').rstrip('/')
+if APP_PREFIX and (not APP_PREFIX.startswith('/') or '..' in APP_PREFIX or '?' in APP_PREFIX or '#' in APP_PREFIX):
+    raise ValueError('Invalid application URL prefix')
+FORCE_SCRIPT_NAME = APP_PREFIX or None
+ALLOWED_HOSTS = os.environ.get('TRANSCRIBER_ALLOWED_HOSTS', 'localhost,127.0.0.1,[::1]').split(',')
+DATA_ROOT, generated_secret = initialize_storage(
+    os.environ.get('TRANSCRIBER_DATA_ROOT', str(Path.home() / '.local/share/transcriber-aau'))
+)
+SECRET_KEY = os.environ.get('SECRET_KEY') or generated_secret
 DJANGO_LOG_HANDLER = os.environ.get('DJANGO_LOG_HANDLER', 'console')
-DJANGO_LOG_FILE = os.environ.get('DJANGO_LOG_FILE', '/var/log/django/app.log')
+DJANGO_LOG_FILE = str(DATA_ROOT / 'logs/django.log')
 MEMORY_IN_GIGS = os.environ.get('MEMORY_IN_GIGS', '16')
+JOBS_ROOT = DATA_ROOT / 'jobs'
+INPUT_ROOTS = json.loads(os.environ.get('TRANSCRIBER_INPUT_ROOTS', json.dumps({'home': str(Path.home())})))
+RESOURCE_PROFILES = json.loads(os.environ.get('TRANSCRIBER_RESOURCE_PROFILES',
+    '{"cpu-test": {"label": "CPU testing", "memory_gb": 16}}'))
+MAX_UPLOAD_FILE_BYTES = int(os.environ.get('TRANSCRIBER_MAX_FILE_BYTES', 2 * 1024**3))
+MAX_UPLOAD_BATCH_BYTES = int(os.environ.get('TRANSCRIBER_MAX_BATCH_BYTES', 10 * 1024**3))
+MAX_UPLOAD_FILES = int(os.environ.get('TRANSCRIBER_MAX_FILES', 100))
+ALLOWED_AUDIO_EXTENSIONS = {'.mp3', '.wav', '.m4a', '.mp4', '.mpeg', '.mpg', '.wma', '.mkv'}
+TRANSCRIPTION_MODELS = {'whisper/base', 'whisper/small', 'whisper/medium',
+    'whisper/large-v3', 'whisper/large-v3-turbo', 'nvidia/parakeet-tdt-0.6b-v3'}
+TRANSCRIBER_DEFAULT_MODEL = os.environ.get('TRANSCRIBER_DEFAULT_MODEL', 'whisper/base')
+TRANSCRIBER_SLURM_ENABLED = os.environ.get('TRANSCRIBER_SLURM_ENABLED') == 'True'
+SLURM_COMMAND_PREFIX = json.loads(os.environ.get('TRANSCRIBER_SLURM_COMMAND_PREFIX', '[]'))
+SLURM_RPC_TIMEOUT = int(os.environ.get('TRANSCRIBER_SLURM_RPC_TIMEOUT', 15))
+SLURM_RESULT_GRACE_SECONDS = int(os.environ.get('TRANSCRIBER_SLURM_RESULT_GRACE_SECONDS', 60))
+TRANSCRIBER_COMPUTE_PYTHON = os.environ.get('TRANSCRIBER_COMPUTE_PYTHON', '/usr/bin/python3')
+TRANSCRIBER_RUNNER_PATH = Path(os.environ.get('TRANSCRIBER_RUNNER_PATH',
+    str(BASE_DIR / 'transcriber/batch_runner.py')))
+TRANSCRIBER_WORKER_COMMAND = json.loads(os.environ.get('TRANSCRIBER_WORKER_COMMAND', '[]'))
+TRANSCRIBER_FFMPEG_COMMAND = json.loads(os.environ.get('TRANSCRIBER_FFMPEG_COMMAND', '["ffmpeg"]'))
 
 # Application definition
 
@@ -47,6 +81,7 @@ INSTALLED_APPS = [
 MIDDLEWARE = [
     'corsheaders.middleware.CorsMiddleware',
     'django.middleware.security.SecurityMiddleware',
+    'whitenoise.middleware.WhiteNoiseMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
@@ -82,7 +117,8 @@ WSGI_APPLICATION = 'django-project.wsgi.application'
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
+        'NAME': DATA_ROOT / 'db.sqlite3',
+        'OPTIONS': {'timeout': 20},
     }
 }
 
@@ -117,21 +153,6 @@ USE_I18N = True
 
 USE_TZ = True
 
-def _has_usable_subdirectory(directory_path: Path):
-    # Iterate through the entries in the directory
-    for entry in os.scandir(directory_path):
-        # Check if the entry is a directory
-        if entry.is_dir() and entry.name != 'UPLOADS':
-            return True, entry.name
-    return False, ''
-
-def _has_transcriptions_subdirectory(directory_path: Path):
-    # Iterate through the entries in the directory
-    for entry in os.scandir(directory_path):
-        if entry.is_dir() and entry.name == 'TRANSCRIPTIONS':
-            return True
-    return False
-
 # Static files (CSS, JavaScript, Images)
 # https://docs.djangoproject.com/en/5.1/howto/static-files/
 
@@ -142,38 +163,32 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 STATICFILES_DIRS = [BASE_DIR / 'frontend' / 'build' / 'static']
 
-STATIC_URL = '/static/'
-STATIC_ROOT = BASE_DIR / 'staticfiles'
+STATIC_URL = APP_PREFIX + '/static/'
+STATIC_ROOT = DATA_ROOT / 'staticfiles'
 
-MEDIA_URL = '/media/'
+MEDIA_URL = APP_PREFIX + '/media/'
 
-DEFAULT_MEDIA_ROOT = BASE_DIR / 'media'
-
-UCLOUD_DIRECTORY = BASE_DIR / 'ucloud'
-
-# Resolve MEDIA_ROOT at startup:
-# - If UCLOUD_DIRECTORY is mounted and usable, use it. (The user started job with folder added).
-# - Otherwise fall back to default media root. Will be /work for UCloud
-folder_mounted, folder_name = _has_usable_subdirectory(UCLOUD_DIRECTORY)
-if folder_mounted and PROD:
-    media_root_candidate = Path(UCLOUD_DIRECTORY) / folder_name
-    if _has_transcriptions_subdirectory(media_root_candidate):
-        # if this directory has a "TRANSCRIPTIONS" folder in it, use the parent folder as MEDIA_ROOT
-        MEDIA_ROOT = UCLOUD_DIRECTORY
-    else:
-        MEDIA_ROOT = Path(UCLOUD_DIRECTORY) / folder_name
-else:
-    MEDIA_ROOT = DEFAULT_MEDIA_ROOT
-
-FILE_UPLOAD_MAX_MEMORY_SIZE = 50000000000
+MEDIA_ROOT = DATA_ROOT / 'media'
+FILE_UPLOAD_TEMP_DIR = str(DATA_ROOT / 'tmp')
+FILE_UPLOAD_MAX_MEMORY_SIZE = 2 * 1024 * 1024
+FILE_UPLOAD_PERMISSIONS = 0o600
+FILE_UPLOAD_DIRECTORY_PERMISSIONS = 0o700
 
 #CORS_ALLOW_ALL_ORIGINS = True
 #CORS_ORIGIN_ALLOW_ALL = True  # allow all origins
-SESSION_COOKIE_SECURE = True  # Set to True in production with HTTPS
+SESSION_COOKIE_SECURE = PROD
 SESSION_COOKIE_HTTPONLY = True
-SESSION_COOKIE_SAMESITE = 'None'  # Adjust as needed (e.g., 'Strict' or 'None' for cross-origin)
-CSRF_COOKIE_SECURE = True
-CSRF_COOKIE_SAMESITE = 'None'
+SESSION_COOKIE_SAMESITE = 'Lax'
+SESSION_COOKIE_PATH = APP_PREFIX + '/'
+CSRF_COOKIE_PATH = APP_PREFIX + '/'
+COOKIE_SUFFIX = '_' + hashlib.sha256(APP_PREFIX.encode()).hexdigest()[:10] if APP_PREFIX else ''
+SESSION_COOKIE_NAME = 'transcriber_session' + COOKIE_SUFFIX
+CSRF_COOKIE_NAME = 'csrftoken' + COOKIE_SUFFIX
+CSRF_COOKIE_SECURE = PROD
+CSRF_COOKIE_SAMESITE = 'Lax'
+CSRF_TRUSTED_ORIGINS = os.environ.get('TRANSCRIBER_TRUSTED_ORIGINS',
+    '' if PROD else 'http://localhost:5173,http://127.0.0.1:5173').split(',')
+CSRF_TRUSTED_ORIGINS = [origin for origin in CSRF_TRUSTED_ORIGINS if origin]
 CORS_ALLOW_CREDENTIALS = True
 CORS_ALLOWED_ORIGINS = [
     'http://localhost:3000',  # frontend URL, react development server

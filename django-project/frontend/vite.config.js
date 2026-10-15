@@ -3,11 +3,27 @@ import react from '@vitejs/plugin-react';
 import basicSsl from '@vitejs/plugin-basic-ssl';
 
 export default defineConfig({
-    plugins: [react()],
+    base: './',
+    plugins: [react(), {
+        name: 'development-runtime-config',
+        transformIndexHtml(html, context) {
+            if (!context.server) return html;
+            return html.replace('{{ app_prefix }}', '').replace('{{ csrf_cookie_name }}', 'csrftoken')
+                .replace('{{ app_base }}', '/');
+        },
+    }],
     //plugins: [react(), basicSsl()],
     server: {
-        host: true, // make development server accessible from the wireless network, for testing on mobile device
+        host: '127.0.0.1',
         proxy: {
+            '/hpc-files': {
+                target: 'http://127.0.0.1:8000',
+                changeOrigin: true,
+            },
+            '/active-transcription': {
+                target: 'http://127.0.0.1:8000',
+                changeOrigin: true,
+            },
             // Proxying API requests to avoid CORS issues during development
             '/upload': {
                 target: 'http://localhost:8000',

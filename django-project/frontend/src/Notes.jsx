@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
+import { apiFetch as fetch, appUrl } from './api.js';
 
 // Utility helper to convert HH:MM:SS.mmm to seconds
 function timestampToSeconds(timestamp) {
@@ -277,11 +278,10 @@ const Notes = ({ transcriptionKey, transcriptionData, onBackToDashboard, onBackT
         const dirName = transcriptionData?.name;
         if (!dirName) return;
 
-        const downloadUrl = `/export-file/?dir_name=${encodeURIComponent(dirName)}&target=${exportTarget}&format=${exportFormat}&merged=${mergedFormat}`;
+        const downloadUrl = appUrl(`/export-file/?dir_name=${encodeURIComponent(dirName)}&target=${exportTarget}&format=${exportFormat}&merged=${mergedFormat}`);
 
         const link = document.createElement('a');
         link.href = downloadUrl;
-        link.download = '';
         document.body.appendChild(link);
         link.click();
         document.body.removeChild(link);

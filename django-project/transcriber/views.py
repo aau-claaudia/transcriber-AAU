@@ -1,221 +1,118 @@
-from celery import chain
 from django.conf import settings
-from django.shortcuts import render
+from django.shortcuts import render, get_object_or_404
 from django.http import JsonResponse, HttpResponse, Http404
-from django.views.decorators.csrf import csrf_exempt
-from transcriber.models import FileUpload
+from django.views.decorators.csrf import csrf_exempt, ensure_csrf_cookie
+from django.views.decorators.http import require_POST, require_GET
+from django.utils import timezone as django_timezone
+from transcriber.models import Transcription
 import os
 import json
+from urllib.parse import quote
+from django.utils.http import content_disposition_header
 from datetime import datetime, timezone
-from .tasks import transcription_task, shutdown_server_task
-from .model_memory_util import calculate_available_memory
+from .staging import stage_uploads, transcription_status, ActiveTranscriptionError
+from .hpc_files import list_directory, root_options
+from .slurm import reconcile, cancel
 from .utils import convert_to_mp3
 import logging
 from transcriber.exporter import export
 
 logger = logging.getLogger(__name__)
 
+@ensure_csrf_cookie
 def index(request):
-    return render(request, 'frontend/build/index.html')
+    return render(request, 'frontend/build/index.html', {
+        'app_prefix': settings.APP_PREFIX,
+        'app_base': settings.APP_PREFIX + '/',
+        'csrf_cookie_name': settings.CSRF_COOKIE_NAME,
+    })
 
-@csrf_exempt
+@require_POST
 def upload_file(request):
     """
     POST /upload/
     Multipart form data:
       - files            : one or more uploaded audio/video files
-      - file_meta_data   : JSON string — [{name, size, filepath, target_path_sym_link}, ...]
+            - file_meta_data   : optional JSON array of expected names and sizes
       - model            : whisper model name
       - language         : language code
-      - transcribe_and_shutdown : 'true' | 'false'
+            - resource_profile : configured resource profile identifier
+            - existing_files   : signed HPC file-selection tokens
     """
-    if request.method != 'POST':
-        return JsonResponse({'error': 'POST required'}, status=405)
-
-    files = request.FILES.getlist('files')
-    file_meta_data_raw = request.POST.get('file_meta_data')
-
-    if files and file_meta_data_raw:
-        try:
-            file_meta_data_list = json.loads(file_meta_data_raw)
-            if not isinstance(file_meta_data_list, list):
-                return JsonResponse({'error': 'file_meta_data must be a JSON array'}, status=400)
-            for entry in file_meta_data_list:
-                if not isinstance(entry, dict) or 'name' not in entry or 'size' not in entry:
-                    return JsonResponse({'error': 'Each file_meta_data entry must have name and size'}, status=400)
-        except (json.JSONDecodeError, ValueError):
-            return JsonResponse({'error': 'Invalid file_meta_data JSON'}, status=400)
-
-        for f in files:
-            file_upload = FileUpload(file=f)
-            file_upload.save()
-            if not validate_file_size(file_upload.file.size, file_upload.file.name, file_meta_data_list):
-                return JsonResponse(
-                    {'error': 'The file size of the uploaded file does not match the expected size.'},
-                    status=400
-                )
-
-    model = request.POST.get('model', '')
-    cleaned_model_name = clean_model_name(model)
-    language = request.POST.get('language', '')
-    transcribe_and_shutdown = request.POST.get('transcribe_and_shutdown', 'false')
-
-    if transcribe_and_shutdown == 'true':
-        # This gets the process id of the parent process
-        master_pid = os.getppid()
-        # Chain the transcription task with the shutdown task.
-        # The shutdown_server_task will only execute after transcription_task succeeds.
-        # Note: The result of the chain is the result of the *last* task in the chain.
-        task_chain = chain(transcription_task.s(cleaned_model_name, language), shutdown_server_task.s(master_pid))
-        # Start the chained Celery task
-        task = task_chain.apply_async()
-        return JsonResponse({'task_id': task.parent.id})
-    else:
-        # Start only the transcription task
-        task = transcription_task.delay(cleaned_model_name, language)
-        return JsonResponse({'task_id': task.id})
+    try:
+        if request.POST.get('transcribe_and_shutdown') == 'true':
+            raise ValueError('Server shutdown is not supported in OnDemand')
+        metadata = request.POST.get('file_meta_data')
+        transcription = stage_uploads(
+            request.FILES.getlist('files'), request.POST.get('model', ''),
+            request.POST.get('language', 'auto'), request.POST.get('resource_profile', 'cpu-test'),
+            json.loads(metadata) if metadata is not None else None,
+            existing_tokens=json.loads(request.POST.get('existing_files', '[]')),
+        )
+    except ActiveTranscriptionError as error:
+        return JsonResponse({'error': str(error)}, status=409)
+    except ValueError as error:
+        return JsonResponse({'error': str(error)}, status=400)
+    except OSError:
+        logger.exception('Upload staging failed')
+        return JsonResponse({'error': 'Unable to store uploaded files'}, status=503)
+    return JsonResponse(transcription_status(transcription), status=201)
 
 
 @csrf_exempt
 def link_files(request):
-    """
-    POST /link-files/
-    JSON body: [ {filepath, name, size, target_path_sym_link}, ... ]
-    Creates symlinks from filepath → target_path_sym_link for each entry.
-    """
-    if request.method != 'POST':
-        return JsonResponse({'error': 'POST required'}, status=405)
+    return JsonResponse({'error': 'Legacy symlink selection is disabled'}, status=410)
 
-    try:
-        files_data = json.loads(request.body)
-    except (json.JSONDecodeError, ValueError):
-        return JsonResponse({'error': 'Invalid JSON body'}, status=400)
-
-    if not isinstance(files_data, list):
-        return JsonResponse({'error': 'Request body must be a JSON array'}, status=400)
-
-    for file in files_data:
-        if not isinstance(file, dict):
-            return JsonResponse({'error': 'Each entry must be a JSON object'}, status=400)
-        source = file.get('filepath')
-        target = file.get('target_path_sym_link')
-        if not source or not target:
-            return JsonResponse({'error': 'Each entry must have filepath and target_path_sym_link'}, status=400)
-        if not os.path.exists(target):
-            os.symlink(source, target)
-
-    return JsonResponse({'status': 'success'}, status=200)
-
+@ensure_csrf_cookie
 def get_initialization_data(request):
-    source_directory = settings.UCLOUD_DIRECTORY
-    # target directory for symlinks (for scanned files in UCloud mounted folder)
-    target_directory = os.path.join(settings.MEDIA_ROOT, 'UPLOADS/INPUT')
-    scan_info = {}
-    file_list = []
+    active = Transcription.objects.filter(active_slot=1).first()
+    if active:
+        active = reconcile(active)
+        if active.active_slot is None:
+            active = None
+    results = prepare_results(request)
+    default_profile = next(iter(settings.RESOURCE_PROFILES.values()))
+    return JsonResponse({
+        'file_list': [], 'mounted_folder': False,
+        'available_memory': default_profile['memory_gb'],
+        'resource_profiles': settings.RESOURCE_PROFILES,
+        'default_model': settings.TRANSCRIBER_DEFAULT_MODEL,
+        'input_roots': root_options(),
+        'active_transcription': transcription_status(active) if active else None,
+        'transcriptions': results, 'results': results,
+    })
 
-    # check if there is a mounted folder
-    mounted_folder = has_subdirectories(source_directory)
-    scan_info['mounted_folder'] = mounted_folder
 
-    # Ensure the target directory exists; create UPLOADS/INPUT directory if it doesn't exist
-    os.makedirs(target_directory, exist_ok=True)
+def get_active_transcription(request):
+    active = Transcription.objects.filter(active_slot=1).first()
+    if active:
+        active = reconcile(active)
+        if active.active_slot is None:
+            active = None
+    return JsonResponse({'active_transcription': transcription_status(active) if active else None})
 
-    # Define the allowed file extensions
-    allowed_extensions = {'.mp3', '.wav', '.m4a', '.mp4', '.mpeg', '.mpg', '.wma', '.mkv'}
 
-    if mounted_folder:
-        logger.info("UCloud mounted folder detected.")
-        logger.info(f"MEDIA_ROOT: {settings.MEDIA_ROOT}")
-        for root, dirs, files in os.walk(source_directory):
-            # Don't look in the 'UPLOADS' or 'COMPLETED' directories (used for user uploaded files and already completed)
-            if 'UPLOADS' in dirs:
-                dirs.remove('UPLOADS')
-            if 'COMPLETED' in dirs:
-                dirs.remove('COMPLETED')
-            for filename in files:
-                file_path = os.path.join(root, filename)
-                file_extension = os.path.splitext(filename)[1].lower()
-
-                if file_extension in allowed_extensions:
-                    target_path = os.path.join(target_directory, filename)
-
-                    file_info = {
-                        'name': filename,
-                        'size': os.path.getsize(file_path),
-                        'filepath': file_path,
-                        'target_path_sym_link': target_path
-                    }
-                    file_list.append(file_info)
-
-    scan_info['file_list'] = file_list
-
-    # get the available memory
-    scan_info['available_memory'] = calculate_available_memory()
-    logger.info(f"Available memory: {scan_info['available_memory']}")
-
-    # Return transcription results along with the initialization data
-    scan_info['transcriptions'] = prepare_results(request)
-    scan_info['results'] = scan_info['transcriptions']
-
-    return JsonResponse(scan_info)
+@require_GET
+def browse_hpc_files(request):
+    try:
+        listing = list_directory(request.GET.get('root', ''), request.GET.get('path', ''),
+                                 int(request.GET.get('offset', 0)))
+    except ValueError as error:
+        return JsonResponse({'error': str(error)}, status=400)
+    except OSError:
+        return JsonResponse({'error': 'Directory is not accessible'}, status=403)
+    return JsonResponse(listing)
 
 @csrf_exempt
 def remove_link(request):
-    """
-    POST /remove-link/
-    JSON body: { "path": "<symlink path to remove>" }
-    """
-    if request.method != 'POST':
-        return JsonResponse({'error': 'POST required'}, status=405)
-
-    try:
-        body = json.loads(request.body)
-    except (json.JSONDecodeError, AttributeError):
-        return JsonResponse({'error': 'Invalid JSON body'}, status=400)
-
-    path = body.get('path')
-    if not path:
-        return JsonResponse({'error': 'No path provided'}, status=400)
-
-    try:
-        if os.path.islink(path):
-            os.unlink(path)
-            logger.info(f"Deleted symlink: {path}")
-        else:
-            logger.info(f"Path is not a symlink: {path}")
-    except FileNotFoundError:
-        logger.warning(f"Symlink not found: {path}")
-
-    return JsonResponse({'status': 'success'}, status=200)
+    return JsonResponse({'error': 'Legacy symlink selection is disabled'}, status=410)
 
 def poll_transcription_status(request, task_id):
-    # Get the task result
-    task_result = transcription_task.AsyncResult(task_id)
-    if task_result.state == 'PENDING':
-        response = {
-            'state': task_result.state,
-            'status': 'Task is still processing...'
-        }
-    elif task_result.state != 'FAILURE':
-        response = {
-            'state': task_result.state,
-            'status': task_result.info,  # This is the result returned by the task
-        }
-        if task_result.state == 'SUCCESS':
-            response = {
-                'state': task_result.state,
-                'status': task_result.info,  # This is the result returned by the task
-            }
-            # only add results if the task was not aborted
-            if not "TASK ABORTED" in task_result.info:
-                responses = prepare_results(request)
-                response['result'] = responses
-    else:
-        # Something went wrong in the background job
-        response = {
-            'state': task_result.state,
-            'status': str(task_result.info),  # This is the exception raised
-        }
+    transcription = get_object_or_404(Transcription, pk=task_id)
+    transcription = reconcile(transcription)
+    response = transcription_status(transcription)
+    if transcription.state == Transcription.State.SUCCEEDED:
+        response['result'] = prepare_results(request)
     return JsonResponse(response)
 
 def get_completed_transcriptions(request):
@@ -277,7 +174,7 @@ def _metadata_input_file_name(meta_data):
 def _build_media_absolute_url(request, relative_path):
     media_prefix = settings.MEDIA_URL if settings.MEDIA_URL.endswith('/') else f"{settings.MEDIA_URL}/"
     rel = relative_path.lstrip('/')
-    return request.build_absolute_uri(f"{media_prefix}{rel}")
+    return request.build_absolute_uri(f"{media_prefix}{quote(rel)}")
 
 def _infer_input_file_relative_path(dir_name, meta_data):
     if _metadata_input_converted(meta_data):
@@ -306,14 +203,6 @@ def prepare_results(request):
             # Include first-level folders under MEDIA_ROOT.
             candidate_dirs.append((dir_name, dir_path))
 
-            # Also include folders exactly one level deeper.
-            for child_name in os.listdir(dir_path):
-                if child_name.startswith('.'):
-                    continue
-                child_path = os.path.join(dir_path, child_name)
-                if os.path.isdir(child_path):
-                    candidate_dirs.append((os.path.join(dir_name, child_name), child_path))
-
         for dir_name, dir_path in candidate_dirs:
 
             # Check if a TRANSCRIPTIONS folder exists within this directory
@@ -323,6 +212,7 @@ def prepare_results(request):
                 metadata_path = os.path.join(dir_path, 'data', 'metadata.json')
                 input_file_url = None
                 user_edited = False
+                meta_data = {}
                 edit_file_url = _build_media_absolute_url(request, f"{dir_name}/data/edited_output.json")
                 if os.path.exists(metadata_path):
                     try:
@@ -357,6 +247,9 @@ def prepare_results(request):
                             'created_at': created_at,
                             'input_file_url': input_file_url,
                             'dir_name': dir_name,
+                            'original_file_name': meta_data.get('original_file_name', ''),
+                            'model': meta_data.get('model', ''),
+                            'language': meta_data.get('language', ''),
                             'edit_file_url': edit_file_url,
                             'user_edited': user_edited
                         })
@@ -364,10 +257,13 @@ def prepare_results(request):
     responses.sort(key=lambda x: x['file_name'])
     return responses
 
+@require_POST
 def stop_transcription_task(request, task_id):
-    task_result = transcription_task.AsyncResult(task_id)
-    task_result.revoke(terminate=True)
-    return JsonResponse({'status': 'Task aborted successfully'})
+    transcription = get_object_or_404(Transcription, pk=task_id)
+    if transcription.state == 'running' and not transcription.slurm_job_id:
+        return JsonResponse({'error': 'This job cannot be cancelled by the staging backend'}, status=409)
+    transcription = cancel(transcription)
+    return JsonResponse(transcription_status(transcription))
 
 def serve_file(request, path):
     base_dir = settings.MEDIA_ROOT
@@ -416,7 +312,10 @@ def serve_file(request, path):
         response = HttpResponse(f.read(), content_type=content_type)
     response['Content-Length'] = str(file_size)
     response['Accept-Ranges'] = 'bytes'
-    response['Content-Disposition'] = 'inline; filename="{}"'.format(os.path.basename(file_path))
+    response['Content-Disposition'] = content_disposition_header(
+        os.path.basename(os.path.dirname(file_path)) == 'TRANSCRIPTIONS',
+        os.path.basename(file_path),
+    )
     return response
 
 def export_file(request):

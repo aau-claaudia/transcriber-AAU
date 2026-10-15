@@ -37,15 +37,13 @@ const TranscriptionStatus = ({ statusText, activeTask, percentageDone, transcrib
                                 {file.name}
                             </td>
                             <td>{(file.size / 1000000).toFixed(2)}</td>
-                            <td>{file.ucloud ? "UCloud" : "Upload"}</td>
+                            <td>{file.source === 'hpc' ? 'HPC storage' : 'Upload'}</td>
                         </tr>
                     ))}
                     </tbody>
                 </table>
             </div>
 
-            <h3 style={{marginTop: '1.5rem'}}>Estimated progress based on data size</h3>
-            <progress className="progress-bar" value={transcribeAndShutdown && serverStopped ? 1.0 : percentageDone}/>
         </div>
     );
 };

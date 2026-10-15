@@ -1,12 +1,12 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { useDropzone } from 'react-dropzone';
-import axios from 'axios';
+import { api as axios, apiFetch as fetch, appUrl } from './api.js';
 import Settings from "./Settings.jsx";
 import TranscriptionStatus from "./TranscriptionStatus.jsx";
 import EditPage from "./EditPage.jsx";
 import Notes from "./Notes.jsx";
 import transcriberImage from "./logo-transcriber.png";
-import UcloudFiles from "./UcloudFiles.jsx";
+import HpcFiles from "./HpcFiles.jsx";
 import ErrorOverlay from "./ErrorOverlay.jsx";
 
 function App() {
@@ -73,8 +73,10 @@ function App() {
     };
 
     const [files, setFiles] = useState([]);
-    const [scannedFiles, setScannedFiles] = useState([]);
-    const [scannedAndLinkedFiles, setScannedAndLinkedFiles] = useState([]);
+    const [selectedHpcFiles, setSelectedHpcFiles] = useState([]);
+    const [inputRoots, setInputRoots] = useState([]);
+    const [resourceProfiles, setResourceProfiles] = useState({});
+    const [resourceProfile, setResourceProfile] = useState('cpu-test');
     const [activeTask, setActiveTask] = useState(getInitialArrayState("activeTask"));
     const [rejected, setRejected] = useState([]);
     const [results, setResults] = useState(getInitialArrayState("results"));
@@ -88,15 +90,13 @@ function App() {
     const [dataSize, setDataSize] = useState(getInitialInteger("dataSize"));
     const [percentageDone, setPercentageDone] = useState(getInitialInteger("percentageDone"));
     const [transcriptionStartTime, setTranscriptionStartTime] = useState(getInitialTranscriptionStartTime);
-    const [scanning, setScanning] = useState(false);
     const [showSettings, setShowSettings] = useState(false);
-    const [transcribeAndShutdown, setTranscribeAndShutdown] = useState(getInitialBooleanState("transcribeAndShutdown", false));
+    const [transcribeAndShutdown, setTranscribeAndShutdown] = useState(false);
     const [serverStopped, setServerStopped] = useState(getInitialBooleanState("serverStopped", false));
     const [modelSize, setModelSize] = useState("large-v3");
     const [availableMemory, setAvailableMemory] = useState(16.0);
     const [language, setLanguage] = useState(getInitialString("language", "auto"))
     const [errorState, setErrorState] = useState(false);
-    const [ucloudFolderMounted, setUcloudFolderMounted] = useState(getInitialBooleanState("ucloudFolderMounted", false));
     const [currentPage, setCurrentPage] = useState('dashboard');
     const [selectedTranscriptionKey, setSelectedTranscriptionKey] = useState(null);
     const [error, setError] = useState(null);
@@ -109,14 +109,22 @@ function App() {
                     throw new Error(`Server returned HTTP ${response.status}: ${response.statusText}`);
                 }
                 const initData = await response.json();
-                const fileList = initData.file_list;
-                const mountedFolder = initData.mounted_folder;
-                //console.debug('Scanned files from server:', fileList);
-                //console.debug('Mounted folder: ', mountedFolder);
-                sessionStorage.setItem("scannedFiles", JSON.stringify(fileList))
-                sessionStorage.setItem("ucloudFolderMounted", JSON.stringify(mountedFolder))
-                setScannedFiles(fileList)
-                setUcloudFolderMounted(mountedFolder);
+                setResults(initData.results ?? []);
+                setSelectedHpcFiles([]);
+                setInputRoots(initData.input_roots ?? []);
+                setResourceProfiles(initData.resource_profiles ?? {});
+                setResourceProfile(initData.active_transcription?.resource_profile
+                    ?? Object.keys(initData.resource_profiles ?? {})[0] ?? 'cpu-test');
+                const active = initData.active_transcription;
+                setUploading(false);
+                setServerStopped(false);
+                setTranscriptionId(active?.task_id ?? null);
+                setTranscribing(Boolean(active));
+                setButtonDisabled(true);
+                setActiveTask(active?.files ?? []);
+                setStatusText(active?.status ?? '');
+                setPercentageDone(0);
+                setCurrentPage(active ? 'upload' : 'dashboard');
 
                 // get the size of the available memory
                 const memory = initData.available_memory;
@@ -124,7 +132,7 @@ function App() {
                 if (memory && !isNaN(parseFloat(memory))) {
                     const memoryParsed = parseFloat(memory);
                     setAvailableMemory(memoryParsed);
-                    setModelSize(getDefaultModel(memoryParsed));
+                    setModelSize(initData.default_model ?? getDefaultModel(memoryParsed));
                 } else {
                     console.debug("Unable to parse available memory as float value. Defaulting to 16.0 GB.")
                     setAvailableMemory(16.0);
@@ -132,34 +140,11 @@ function App() {
                 }
             } catch (err) {
                 console.error('Error fetching initialization data:', err);
-                setError(new Error("There was an error communicating with the server. Please check that the UCloud job is still running."));
+                setError(new Error("Unable to reach the transcription server."));
             }
         }
         // call the async function
         fetchData().catch(console.error);
-    }, []); // Empty dependency array ensures this runs only once on component mount
-
-    useEffect(() => {
-        const fetchResults = async () => {
-            try {
-                const response = await fetch('/get-completed-transcriptions/');
-                if (!response.ok) {
-                    throw new Error(`Server returned HTTP ${response.status}: ${response.statusText}`);
-                }
-                const data = await response.json();
-                console.debug('Already completed transcription returned from server:', data.result);
-                setResults(data.result)
-            } catch (err) {
-                console.error('Error fetching completed transcriptions:', err);
-                setError(new Error("There was an error communicating with the server. Please check that the UCloud job is still running."));
-            }
-            // if a transcription is underway, show the upload page
-            if (transcribing) {
-                setCurrentPage("upload");
-            }
-        }
-        // call the async function
-        fetchResults().catch(console.error);
     }, []); // Empty dependency array ensures this runs only once on component mount
 
     useEffect(() => {
@@ -185,12 +170,12 @@ function App() {
     }, [transcribing]);
     useEffect(() => {
         // file objects cannot be serialized properly with JSON.stringify. If we really want this serialization to the session we must pick metadata or store using library
-        if (files.length === 0 && scannedAndLinkedFiles.length === 0) {
+        if (files.length === 0 && selectedHpcFiles.length === 0) {
             setButtonDisabled(true);
         } else if (!transcribing) {
             setButtonDisabled(false);
         }
-    }, [files, scannedAndLinkedFiles]);
+    }, [files, selectedHpcFiles]);
     useEffect(() => {
         sessionStorage.setItem("transcriptionId", JSON.stringify(transcriptionId))
     }, [transcriptionId]);
@@ -219,92 +204,40 @@ function App() {
         setShowSettings(!showSettings);
     }
 
-    const updateStatusInformation = () => {
-        setTimeout(() => pollTranscriptionStatus(transcriptionIdRef.current), 5000);
-        let dataText = "";
-        if (dataSize > 1000000000) {
-            dataText = (dataSize / 1000000000).toFixed(2) + " GB";
-        } else {
-            dataText = (dataSize / 1000000).toFixed(2) + " MB";
-        }
-        let duration = Date.now() - transcriptionStartTime;
-        let waitingText = "Transcribing " + dataText + " of data. The transcription time on a GPU can be roughly estimated to 1 minute pr. 1 MB of data. ";
-        waitingText += "Total duration of the transcription so far is: " + formatDuration(duration);
-        setStatusText(waitingText);
-        let expectedDurationSeconds = Math.floor(dataSize / 1000000 * 60)
-        let durationSeconds = Math.floor(duration / 1000)
-        let percentage = durationSeconds / expectedDurationSeconds;
-        // don't show higher progress percentage than 90 %
-        setPercentageDone(percentage < 0.9 ? percentage : 0.9);
-    }
-
-    // Function to poll the server for transcription status
-    const pollTranscriptionStatus = useCallback((taskId) => {
-        console.debug("Running poll funtion.");
-        console.debug("Transcriptionid = " + taskId);
-        if (taskId) {
-            console.debug("Requesting status from server.");
-            fetch(`/poll-transcription-status/${taskId}/`)
-                .then(response => {
-                    if (!response.ok) {
-                        // Throw an error if the server response is not OK (e.g., 404, 500).
-                        // This prevents trying to parse an HTML error page as JSON.
-                        throw new Error(`Server is unavailable or returned an error: ${response.status} ${response.statusText}`);
-                    }
-                    return response.json();
-                })
-                .then(data => {
-                    // debug logging the data returned from the server
-                    console.debug('Task status:', data);
-                    if (data.state === 'SUCCESS') {
-                        if (!(data.status === 'TASK ABORTED')) {
-                            console.debug('Task result:', data.result);
-                            setResults(data.result);
-                        }
-                        setTranscriptionId(null);
-                        setTranscribing(false);
-                        setDataSize(0);
-                        setTranscriptionStartTime(null);
-                        setActiveTask([]);
-                        setPercentageDone(0);
-                        if (files.length > 0 || scannedAndLinkedFiles.length > 0) {
-                            setButtonDisabled(false);
-                        }
-                        if (!transcribeAndShutdown) {
-                            setCurrentPage('dashboard')
-                        }
-                    } else if (data.state === 'FAILURE') {
-                        setTranscriptionId(null);
-                        setTranscribing(false);
-                        setDataSize(0);
-                        setTranscriptionStartTime(null);
-                        setActiveTask([]);
-                        setPercentageDone(0);
-                        console.error('Task failed:', data.status);
-                    } else {
-                        // Task is still processing, poll again after a delay
-                        updateStatusInformation();
-                    }
-                })
-                .catch(error => {
-                    if (transcribeAndShutdown) {
-                        // the server has now stopped, and we can update to show this information on the status page
-                        setServerStopped(true);
-                    } else {
-                        console.error('Error polling task:', error);
-                        setError(new Error("There was an error communicating with the server. Please check that the UCloud job is still running."));
-                    }
-                });
-        } else {
-            console.debug("Transcription task was cancelled.")
-        }
-    }, [dataSize, transcriptionStartTime, files, scannedAndLinkedFiles, transcriptionId]);
-
-    // effect for starting to poll the server for transcription status if there is an active transcriptionId
     useEffect(() => {
-        console.debug("Checking for active transcription ID.");
-        transcriptionId ? setTimeout(() => pollTranscriptionStatus(transcriptionIdRef.current), 5000) : console.log("No active transcription task to poll.")
-    }, [transcriptionId, pollTranscriptionStatus])
+        if (!transcriptionId) return;
+        const controller = new AbortController();
+        let timer;
+        const poll = async () => {
+            try {
+                const response = await fetch(`/poll-transcription-status/${transcriptionId}/`, {signal: controller.signal});
+                if (!response.ok) throw new Error(`Unable to retrieve transcription: HTTP ${response.status}`);
+                const data = await response.json();
+                if (controller.signal.aborted) return;
+                setStatusText(data.status);
+                if (['SUCCESS', 'FAILURE', 'CANCELLED'].includes(data.state)) {
+                    setTranscriptionId(null);
+                    setTranscribing(false);
+                    setActiveTask([]);
+                    if (data.state === 'SUCCESS') {
+                        setResults(data.result ?? []);
+                        setCurrentPage('dashboard');
+                    }
+                    if (data.state === 'FAILURE') setErrorState(true);
+                    return;
+                }
+            } catch (error) {
+                if (controller.signal.aborted) return;
+                setStatusText('Status temporarily unavailable. Retrying...');
+            }
+            timer = setTimeout(poll, 5000);
+        };
+        poll();
+        return () => {
+            controller.abort();
+            clearTimeout(timer);
+        };
+    }, [transcriptionId]);
 
     const inferDirNameFromFileUrl = (fileUrl) => {
         if (!fileUrl) return '';
@@ -321,8 +254,8 @@ function App() {
         if (markerIndex === -1) return '';
 
         let basePath = pathname.slice(0, markerIndex);
-        if (basePath.startsWith('/media/')) {
-            return basePath.slice('/media/'.length);
+        if (basePath.startsWith(appUrl('/media/'))) {
+            return basePath.slice(appUrl('/media/').length);
         }
         if (basePath.startsWith('/work/')) {
             return basePath.slice('/work/'.length);
@@ -339,39 +272,12 @@ function App() {
         }
 
         if (!acc[dirName]) {
-            const nameParts = dirName.split('_');
-
-            let run_postfix = ''
-
-            // Remove optional trailing run suffix: _runN (postfix added for name collisions)
-            if (nameParts.length >= 4) {
-                const lastPart = nameParts[nameParts.length - 1];
-                if (lastPart.startsWith('run')) {
-                    const runNumber = lastPart.slice(3);
-                    const isNumericRun = runNumber.length > 0 && runNumber.split('').every((char) => char >= '0' && char <= '9');
-                    if (isNumericRun) {
-                        run_postfix = nameParts.pop();
-                    }
-                }
-            }
-
-            let displayName = nameParts.join('_');
-            let model = '';
-            let lang = '';
-
-            // Parse from right: <input_file_name>_<model>_<language>[_runN]
-            if (nameParts.length >= 3) {
-                lang = nameParts.pop();
-                model = nameParts.pop();
-                displayName = nameParts.join('_');
-            }
-
             acc[dirName] = {
                 name: dirName,
-                displayName,
-                model,
-                language: lang,
-                runPostFix: run_postfix,
+                displayName: result.original_file_name,
+                model: result.model,
+                language: result.language,
+                runPostFix: dirName.match(/_run\d+$/)?.[0].slice(1) || '',
                 date: result.created_at || Date.now() / 1000,
                 files: [],
                 mergedFiles: [],
@@ -393,7 +299,7 @@ function App() {
             acc[dirName].logFiles.push(result);
         } else if (fileName === 'files.zip') {
             acc[dirName].zipFile = result;
-        } else if (fileName.split('.')[0].endsWith('_merged')) {
+        } else if (/_merged\.(?:csv|docx|dote\.json|srt|vtt)$/.test(fileName)) {
             acc[dirName].mergedFiles.push(result);
         } else {
             acc[dirName].files.push(result);
@@ -462,9 +368,10 @@ function App() {
         formData.append('file_meta_data', JSON.stringify(fileMetaDataForValidation));
         formData.append('model', modelSize);
         formData.append('language', language);
+        formData.append('resource_profile', resourceProfile);
         formData.append('transcribe_and_shutdown', transcribeAndShutdown);
-        // also sum datasize for linked UCloud files
-        scannedAndLinkedFiles.forEach((file) => {
+        formData.append('existing_files', JSON.stringify(selectedHpcFiles.map(file => file.token)));
+        selectedHpcFiles.forEach((file) => {
             totalDataSizeBytes += file.size;
         })
         setDataSize(totalDataSizeBytes);
@@ -482,26 +389,19 @@ function App() {
             });
             console.debug('the transcription id is: ' + response.data.task_id)
             setTranscriptionId(response.data.task_id)
-            // update the list of files that is currently worked on
-            let activeTranscriptionList = [];
-            files.forEach((file) => {
-                addFileDataToList(file, activeTranscriptionList, false)
-            });
-            scannedAndLinkedFiles.forEach((file) => {
-                addFileDataToList(file, activeTranscriptionList, true)
-            });
-            setActiveTask(activeTranscriptionList);
+            setActiveTask(response.data.files ?? []);
             setUploading(false);
             setTranscribing(true);
-            setStatusText('Starting to transcribe selected files...');
+            setStatusText(response.data.status);
+            resetFileArrays();
         } catch (error) {
             console.error('Error uploading file:', error);
             setUploading(false);
-            setStatusText("Something went wrong when trying to upload files.")
+            setStatusText(error.response?.data?.error ?? "Unable to upload files.")
             setErrorState(true);
+            setButtonDisabled(false);
         } finally {
             setProgress(0);
-            resetFileArrays()
         }
     };
 
@@ -516,81 +416,28 @@ function App() {
     }
 
     const onStopTranscription = async (e) => {
-        // send stop request to backend
-        console.debug("Stopping transcription.")
-        if (transcriptionId) {
-            fetch(`/stop_transcription_task/${transcriptionId}/`)
-                .then(response => response.json())
-                .then(data => {
-                    // debug logging the data returned from the server
-                    console.debug('Task status:', data);
-                })
-                .catch(error => {
-                    console.error('Error stopping task:', error);
-                });
-        } else {
-            console.debug("No active transcription id, nothing to stop.")
+        if (!transcriptionId) return;
+        try {
+            const response = await axios.post(`/stop_transcription_task/${transcriptionId}/`);
+            setStatusText(response.data.status);
+            if (response.data.state === 'CANCELLED') resetData();
+        } catch (error) {
+            setError(new Error(error.response?.data?.error ?? 'Unable to cancel transcription.'));
         }
-        // reset data
-        resetData();
     };
 
     const resetFileArrays = () => {
         setFiles([]);
         setRejected([]);
-        setScannedAndLinkedFiles([]);
+        setSelectedHpcFiles([]);
     }
 
-    const addFileDataToList = (file, list, ucloud) => {
-        list.push({
-            "name": file.name,
-            "size": file.size,
-            "ucloud": ucloud
-        })
-    }
-
-    const onScan = async (e) => {
-        e.preventDefault();
+    const toggleHpcFile = file => {
         setErrorState(false);
-        setScanning(true); // Disable the scan button
-        try {
-            const response = await fetch('/get-initialization-data/');
-            const initData = await response.json();
-            const fileList = initData.file_list;
-            //console.debug('Scanned files:', fileList);
-            setScannedFiles(fileList)
-        } catch (error) {
-            console.error('Error scanning UCloud mounted folder for upload files:', error);
-        } finally {
-            setScanning(false);
-        }
-    }
-
-    const onAddUcloudFiles = async (filesToAdd) => {
-        setErrorState(false);
-        if (filesToAdd?.length > 0) {
-            try {
-                // call view to create the symlinks
-                const response = await axios.post('/link-files/', filesToAdd, {
-                    headers: { 'Content-Type': 'application/json' },
-                });
-                // add the files to setScannedAndLinkedFiles
-                if (response.status === 200) {
-                    let newFiles = filesToAdd.filter((file) =>
-                        !scannedAndLinkedFiles.some(scannedFile => scannedFile.filepath === file.filepath));
-                    setScannedAndLinkedFiles(previousFiles => [
-                        ...previousFiles,
-                        ...newFiles
-                    ])
-                } else {
-                    console.error("Error from server when creating links to UCLoud files.")
-                }
-            } catch (error) {
-                console.error('Error creating symlinks for UCloud files:', error);
-            } finally {
-            }
-        }
-    }
+        setSelectedHpcFiles(previous => previous.some(selected => selected.root === file.root && selected.path === file.path)
+            ? previous.filter(selected => selected.root !== file.root || selected.path !== file.path)
+            : [...previous, file]);
+    };
 
     const onUpdateModel = (modelSize) => {
         setModelSize(modelSize)
@@ -622,25 +469,9 @@ function App() {
         setFiles(files => files.filter(file => file.name !== name))
     }
 
-    const removeUCloudLinkedFile = async (path) => {
-        if (path) {
-            try {
-                // call view to remove the symbolic link to the UCloud file
-                const response = await axios.post('/remove-link/', { path }, {
-                    headers: { 'Content-Type': 'application/json' },
-                });
-                if (response.status === 200) {
-                    // remove the file in the list of linked files to update the UI
-                    setScannedAndLinkedFiles(files => files.filter(file => file.target_path_sym_link !== path))
-                } else {
-                    console.error("Error from server when removing link to UCLoud file.")
-                }
-            } catch (error) {
-                console.error('Error removing symlink for UCloud file:', error);
-            } finally {
-            }
-        }
-    }
+    const removeHpcFile = file => {
+        setSelectedHpcFiles(previous => previous.filter(selected => selected.root !== file.root || selected.path !== file.path));
+    };
 
     const { getRootProps, getInputProps, isDragActive } = useDropzone({
         onDrop,
@@ -656,7 +487,7 @@ function App() {
     });
 
     const setServerConnectionError = () => {
-        setError(new Error("There was an error communicating with the server. Please check that the UCloud job is still running."));
+        setError(new Error("Unable to reach the transcription server."));
     }
 
     return (
@@ -751,13 +582,13 @@ function App() {
                 <div className="card-panel" style={{ animation: 'fadeIn 0.4s ease-out' }}>
                     <h2>New Transcription</h2>
                     <p style={{ marginBottom: '1.5rem' }}>
-                        Upload audio or video files from your computer or select files from your UCloud folder to begin transcribing.
+                        Upload audio or video files from your computer.
                     </p>
 
                     {/* Selected files display */}
-                    {(files.length > 0 || scannedAndLinkedFiles.length > 0) && (
+                    {(files.length > 0 || selectedHpcFiles.length > 0) && (
                         <div style={{ marginBottom: '1.5rem' }}>
-                            <h3>Selected Files ({files.length + scannedAndLinkedFiles.length})</h3>
+                            <h3>Selected Files ({files.length + selectedHpcFiles.length})</h3>
                             <div className="file-list-group">
                                 {files.map((file, index) => (
                                     <div className="file-item" key={'local-' + index}>
@@ -767,11 +598,11 @@ function App() {
                                         </div>
                                     </div>
                                 ))}
-                                {scannedAndLinkedFiles.map((file, index) => (
-                                    <div className="file-item" key={'ucloud-' + index}>
+                                {selectedHpcFiles.map((file, index) => (
+                                    <div className="file-item" key={'hpc-' + index}>
                                         <span className="file-name">☁️ {file.name}</span>
                                         <div className="file-item-actions">
-                                            <button className="remove-btn" type="button" onClick={() => removeUCloudLinkedFile(file.target_path_sym_link)}>Remove</button>
+                                            <button className="remove-btn" type="button" onClick={() => removeHpcFile(file)}>Remove</button>
                                         </div>
                                     </div>
                                 ))}
@@ -798,7 +629,7 @@ function App() {
                     )}
 
                     {/* Action buttons */}
-                    <div style={{ display: 'flex', gap: '1rem', margin: '1.5rem 0' }}>
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: '1rem', margin: '1.5rem 0' }}>
                         <button
                             type="button"
                             onClick={(e) => onTranscribe(e)}
@@ -836,14 +667,9 @@ function App() {
                         </div>
                     )}
 
-                    {/* UCloud Files section */}
-                    {ucloudFolderMounted && !transcribing && (
-                        <UcloudFiles
-                            onAddUcloudFiles={onAddUcloudFiles}
-                            scannedFiles={scannedFiles}
-                            onScan={onScan}
-                            scanning={scanning}
-                        />
+                    {!transcribing && inputRoots.length > 0 && (
+                        <HpcFiles roots={inputRoots} selectedFiles={selectedHpcFiles}
+                            onToggle={toggleHpcFile} disabled={uploading} />
                     )}
 
                     {/* Status panel */}
@@ -896,6 +722,12 @@ function App() {
                             onUpdateModel={onUpdateModel}
                             currentModelSize={modelSize}
                             availableMemory={availableMemory}
+                            resourceProfiles={resourceProfiles}
+                            resourceProfile={resourceProfile}
+                            onUpdateResourceProfile={profile => {
+                                setResourceProfile(profile);
+                                setAvailableMemory(resourceProfiles[profile]?.memory_gb ?? 16);
+                            }}
                             transcriptionModels={TRANSCRIPTION_MODELS}
                             onUpdateLanguage={onUpdateLanguage}
                             currentLanguage={language}
