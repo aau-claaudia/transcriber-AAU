@@ -4,10 +4,12 @@ import json
 import re
 import shlex
 import subprocess
+from datetime import timezone as datetime_timezone
 from pathlib import Path
 
 from django.conf import settings
 from django.utils import timezone
+from django.utils.dateparse import parse_datetime
 
 from .batch_runner import checked_path, transcription_files
 from .models import Transcription
@@ -40,7 +42,8 @@ def call_slurm(arguments, script=None):
     try:
         result = subprocess.run(settings.SLURM_COMMAND_PREFIX + arguments, input=script,
                                 text=True, capture_output=True, check=True,
-                                timeout=settings.SLURM_RPC_TIMEOUT)
+                                timeout=settings.SLURM_RPC_TIMEOUT,
+                                env={**os.environ, 'TZ': 'UTC', 'SLURM_TIME_FORMAT': 'standard'})
         return result.stdout
     except (OSError, subprocess.SubprocessError) as error:
         raise SchedulerError('Scheduler request failed; reconciliation will retry') from error
@@ -126,7 +129,7 @@ def query(record):
     username = current_user()
     filter_args = ['--jobs', record.slurm_job_id] if record.slurm_job_id else ['--name', job_name(record)]
     try:
-        live = call_slurm(['squeue', '--noheader', '--user', username, '--format=%i|%j|%T'] + filter_args)
+        live = call_slurm(['squeue', '--noheader', '--user', username, '--format=%i|%j|%T|%S'] + filter_args)
     except SchedulerError as error:
         cause = error.__cause__
         if (record.slurm_job_id and isinstance(cause, subprocess.CalledProcessError)
@@ -137,18 +140,19 @@ def query(record):
     rows = []
     for line in live.splitlines():
         fields = line.strip().split('|')
-        if len(fields) == 3 and fields[1] == job_name(record) and fields[0].isdigit():
-            rows.append((fields[0], fields[2], ''))
+        if len(fields) >= 3 and fields[1] == job_name(record) and fields[0].isdigit():
+            rows.append((fields[0], fields[2], '', fields[3] if len(fields) > 3 else ''))
     if rows:
         return rows
     filter_args = ['--jobs', record.slurm_job_id] if record.slurm_job_id else ['--name', job_name(record)]
     history = call_slurm(['sacct', '--noheader', '--parsable2', '--allocations', '--user', username,
                          '--starttime', record.created_at.strftime('%Y-%m-%d'),
-                         '--format=JobIDRaw,JobName%80,State,ExitCode'] + filter_args)
+                         '--format=JobIDRaw,JobName%80,State,ExitCode,Start'] + filter_args)
     for line in history.splitlines():
         fields = line.strip().split('|')
         if len(fields) >= 4 and fields[0].isdigit() and fields[1] == job_name(record):
-            rows.append((fields[0], fields[2].split()[0].rstrip('+'), fields[3]))
+            rows.append((fields[0], fields[2].split()[0].rstrip('+'), fields[3],
+                         fields[4] if len(fields) > 4 else ''))
     return rows
 
 
@@ -210,13 +214,22 @@ def reconcile(record):
             raise SchedulerError('Multiple matching jobs found; operator review required')
         if not rows:
             raise SchedulerError('Waiting for scheduler records; the batch will not be resubmitted')
-        identifier, state, exit_code = rows[0]
+        identifier, state, exit_code, start_time = rows[0]
         if record.slurm_job_id and identifier != record.slurm_job_id:
             raise SchedulerError('Scheduler identity mismatch')
         record.refresh_from_db()
         if record.active_slot is None:
             return record
         updates = {'slurm_job_id': identifier, 'updated_at': timezone.now(), 'failure_detail': ''}
+        if start_time and state not in {'PENDING', 'CONFIGURING', 'REQUEUED', 'REQUEUE_FED', 'REQUEUE_HOLD'}:
+            try:
+                started_at = parse_datetime(start_time)
+            except ValueError:
+                started_at = None
+            if started_at is not None:
+                if timezone.is_naive(started_at):
+                    started_at = timezone.make_aware(started_at, datetime_timezone.utc)
+                updates['slurm_started_at'] = started_at
         terminal = False
         if state == 'COMPLETED' and exit_code == '0:0':
             try:

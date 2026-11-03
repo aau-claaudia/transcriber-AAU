@@ -40,6 +40,21 @@ recording directories without a batch completion manifest. Existing results are
 never overwritten. This layout replaces the previous UUID-based result layout;
 there is no compatibility reader for that development format.
 
+### Slurm transcription status
+
+The status view refreshes on the existing five-second poll. It displays the Slurm
+job ID, actual start time, elapsed time, and an estimated runtime of one minute
+per MB (1,000,000 bytes), summed across uploaded and HPC-selected files. Queue
+waiting is excluded. Estimated progress is capped at 90% while running; exceeding
+the estimate displays "Taking longer than estimated" rather than implying success.
+Only scheduler confirmation and validated results mark a transcription successful.
+
+The tutorial worker profile requests 24 hours (`time_minutes: 1440`). The target
+partition must allow that limit. Existing jobs retain their submitted limits.
+After deploying these changes, run `manage.py migrate`, rebuild and collect the
+frontend assets, apply the worker profile to the deployed environment, and restart
+Passenger. The start timestamp is persisted so active status survives page reloads.
+
 ### Setting up the environment for development
 
 

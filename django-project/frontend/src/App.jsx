@@ -10,17 +10,6 @@ import HpcFiles from "./HpcFiles.jsx";
 import ErrorOverlay from "./ErrorOverlay.jsx";
 
 function App() {
-    const formatDuration = (duration) => {
-        // Convert duration from milliseconds to seconds
-        const totalSeconds = Math.floor(duration / 1000);
-
-        // Calculate minutes and seconds
-        const minutes = Math.floor(totalSeconds / 60);
-        const seconds = totalSeconds % 60;
-
-        // Format the result
-        return `${minutes} minute(s) and ${seconds} second(s)`;
-    }
     const getInitialArrayState = (keyname) => {
         const dataFromSession = sessionStorage.getItem(keyname);
         return dataFromSession ? JSON.parse(dataFromSession) : [];
@@ -35,14 +24,6 @@ function App() {
     }
     const getInitialTranscriptionStatus = () => {
         const dataFromSession = sessionStorage.getItem("statusText");
-        return dataFromSession ? JSON.parse(dataFromSession) : null;
-    }
-    const getInitialInteger = (keyname) => {
-        const dataFromSession = sessionStorage.getItem(keyname);
-        return dataFromSession ? JSON.parse(dataFromSession) : 0;
-    }
-    const getInitialTranscriptionStartTime = () => {
-        const dataFromSession = sessionStorage.getItem("transcriptionStartTime");
         return dataFromSession ? JSON.parse(dataFromSession) : null;
     }
     const getInitialString = (keyname, value) => {
@@ -87,9 +68,7 @@ function App() {
     const transcriptionIdRef = useRef(transcriptionId);
     const [uploading, setUploading] = useState(getInitialBooleanState("uploading", false));
     const [statusText, setStatusText] = useState(getInitialTranscriptionStatus);
-    const [dataSize, setDataSize] = useState(getInitialInteger("dataSize"));
-    const [percentageDone, setPercentageDone] = useState(getInitialInteger("percentageDone"));
-    const [transcriptionStartTime, setTranscriptionStartTime] = useState(getInitialTranscriptionStartTime);
+    const [transcriptionStatus, setTranscriptionStatus] = useState(null);
     const [showSettings, setShowSettings] = useState(false);
     const [transcribeAndShutdown, setTranscribeAndShutdown] = useState(false);
     const [serverStopped, setServerStopped] = useState(getInitialBooleanState("serverStopped", false));
@@ -123,7 +102,7 @@ function App() {
                 setButtonDisabled(true);
                 setActiveTask(active?.files ?? []);
                 setStatusText(active?.status ?? '');
-                setPercentageDone(0);
+                setTranscriptionStatus(active ?? null);
                 setCurrentPage(active ? 'upload' : 'dashboard');
 
                 // get the size of the available memory
@@ -185,15 +164,6 @@ function App() {
     useEffect(() => {
         sessionStorage.setItem("uploading", JSON.stringify(uploading))
     }, [uploading]);
-    useEffect(() => {
-        sessionStorage.setItem("dataSize", JSON.stringify(dataSize))
-    }, [dataSize]);
-    useEffect(() => {
-        sessionStorage.setItem("percentageDone", JSON.stringify(percentageDone))
-    }, [percentageDone]);
-    useEffect(() => {
-        sessionStorage.setItem("transcriptionStartTime", JSON.stringify(transcriptionStartTime))
-    }, [transcriptionStartTime]);
     // Keep the ref updated with the latest transcriptionId
     useEffect(() => {
         transcriptionIdRef.current = transcriptionId;
@@ -215,6 +185,7 @@ function App() {
                 const data = await response.json();
                 if (controller.signal.aborted) return;
                 setStatusText(data.status);
+                setTranscriptionStatus(data);
                 if (['SUCCESS', 'FAILURE', 'CANCELLED'].includes(data.state)) {
                     setTranscriptionId(null);
                     setTranscribing(false);
@@ -350,14 +321,13 @@ function App() {
         setUploading(true)
         setShowSettings(false); // hide settings
         setErrorState(false);
+        setTranscriptionStatus(null);
 
-        let totalDataSizeBytes = 0;
         const formData = new FormData();
         // also create file meta data object to use for file size validation on uploads on the server side
         const fileMetaDataForValidation = [];
         files.forEach((file) => {
             formData.append('files', file);
-            totalDataSizeBytes += file.size;
             fileMetaDataForValidation.push({
                 "filepath": "",
                 "name": file.name,
@@ -371,11 +341,6 @@ function App() {
         formData.append('resource_profile', resourceProfile);
         formData.append('transcribe_and_shutdown', transcribeAndShutdown);
         formData.append('existing_files', JSON.stringify(selectedHpcFiles.map(file => file.token)));
-        selectedHpcFiles.forEach((file) => {
-            totalDataSizeBytes += file.size;
-        })
-        setDataSize(totalDataSizeBytes);
-        setTranscriptionStartTime(Date.now())
 
         try {
             const response = await axios.post('/upload/', formData, {
@@ -393,6 +358,7 @@ function App() {
             setUploading(false);
             setTranscribing(true);
             setStatusText(response.data.status);
+            setTranscriptionStatus(response.data);
             resetFileArrays();
         } catch (error) {
             console.error('Error uploading file:', error);
@@ -408,10 +374,7 @@ function App() {
     const resetData = () => {
         setTranscriptionId(null);
         setTranscribing(false);
-        setDataSize(0);
-        setTranscriptionStartTime(null);
         setActiveTask([]);
-        setPercentageDone(0);
         resetFileArrays()
     }
 
@@ -420,6 +383,7 @@ function App() {
         try {
             const response = await axios.post(`/stop_transcription_task/${transcriptionId}/`);
             setStatusText(response.data.status);
+            setTranscriptionStatus(response.data);
             if (response.data.state === 'CANCELLED') resetData();
         } catch (error) {
             setError(new Error(error.response?.data?.error ?? 'Unable to cancel transcription.'));
@@ -503,7 +467,7 @@ function App() {
                         className="btn btn-primary"
                         onClick={() => setCurrentPage(currentPage === 'upload' ? 'dashboard' : 'upload')}
                     >
-                        {currentPage === 'upload' ? '← Back to Dashboard' : '+ New Transcription'}
+                        {currentPage === 'upload' ? '← Back to Dashboard' : transcribing ? 'Transcription status' : '+ New Transcription'}
                     </button>
                     <button
                         className="btn btn-secondary"
@@ -673,18 +637,16 @@ function App() {
                     )}
 
                     {/* Status panel */}
-                    {(uploading || transcribing || errorState) && (
+                    {(uploading || transcribing || errorState || transcriptionStatus?.state === 'CANCELLED') && (
                         <div className="status-panel">
                             <h3>Status</h3>
                             {uploading && <p>Uploading files: {progress}%</p>}
-                            {errorState && <p style={{ color: 'var(--accent-rose)' }}>{statusText}</p>}
-                            {transcribing && (
+                            {errorState && !transcriptionStatus && <p style={{ color: 'var(--accent-rose)' }}>{statusText}</p>}
+                            {(transcribing || ['FAILURE', 'CANCELLED'].includes(transcriptionStatus?.state)) && (
                                 <TranscriptionStatus
                                     statusText={statusText}
-                                    activeTask={activeTask}
-                                    percentageDone={percentageDone}
-                                    transcribeAndShutdown={transcribeAndShutdown}
-                                    serverStopped={serverStopped}
+                                    activeTask={transcriptionStatus?.files ?? activeTask}
+                                    status={transcriptionStatus ?? {}}
                                 />
                             )}
                         </div>

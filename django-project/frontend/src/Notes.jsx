@@ -707,9 +707,6 @@ const Notes = ({ transcriptionKey, transcriptionData, onBackToDashboard, onBackT
         <div className="notes-page" style={{ animation: 'fadeIn 0.4s ease-out' }}>
             <div className="page-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.5rem' }}>
                 <div style={{ display: 'flex', gap: '0.75rem' }}>
-                    <button className="btn btn-secondary" onClick={onBackToDashboard}>
-                        ← Back to Dashboard
-                    </button>
                     <button className="btn btn-secondary" onClick={onBackToEdit}>
                         ← Back to Results Page
                     </button>

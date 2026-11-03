@@ -128,6 +128,10 @@ def stage_uploads(files, model, language, profile, metadata=None, existing_token
 
 
 def transcription_status(transcription):
+    elapsed_seconds = None
+    if transcription.slurm_started_at is not None:
+        elapsed_seconds = max(0, ((transcription.finished_at or timezone.now())
+                                 - transcription.slurm_started_at).total_seconds())
     states = {'succeeded': 'SUCCESS', 'failed': 'FAILURE', 'cancelled': 'CANCELLED'}
     messages = {
         'preparing': 'Preparing files from HPC storage',
@@ -145,6 +149,10 @@ def transcription_status(transcription):
         'files': [{'name': entry['name'], 'size': entry['size'], 'source': entry['source']}
               for entry in transcription.input_manifest],
         'created_at': transcription.created_at.isoformat(),
+        'slurm_job_id': transcription.slurm_job_id or None,
+        'slurm_started_at': transcription.slurm_started_at.isoformat() if transcription.slurm_started_at else None,
+        'estimated_duration_seconds': sum(entry['size'] for entry in transcription.input_manifest) / 1000000 * 60,
+        'elapsed_seconds': elapsed_seconds,
     }
 
 

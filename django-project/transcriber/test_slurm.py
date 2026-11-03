@@ -7,7 +7,7 @@ from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase, override_settings
 
 from .models import Transcription
-from .staging import stage_uploads
+from .staging import stage_uploads, transcription_status
 from .slurm import submit, reconcile, cancel, SchedulerError
 
 
@@ -62,6 +62,75 @@ class SlurmTests(TestCase):
     def queued(self):
         with patch('transcriber.slurm.call_slurm', return_value='123'):
             submit(self.record)
+
+    def test_running_status_uses_scheduler_start_and_manifest_sizes(self):
+        from datetime import datetime, timezone
+        self.queued()
+        started = datetime(2026, 11, 3, 12, 0, tzinfo=timezone.utc)
+        self.record.input_manifest = [
+            {'name': 'upload.wav', 'size': 1000000, 'source': 'upload'},
+            {'name': 'selected.mp3', 'size': 2000000, 'source': 'hpc'},
+        ]
+        self.record.save()
+        with patch('transcriber.slurm.call_slurm', return_value=f'123|{self.name}|RUNNING|2026-11-03T12:00:00\n'):
+            reconcile(self.record)
+        with patch('transcriber.staging.timezone.now', return_value=started.replace(minute=1)):
+            status = transcription_status(self.record)
+        self.assertEqual(status['slurm_job_id'], '123')
+        self.assertEqual(status['slurm_started_at'], started.isoformat())
+        self.assertEqual(status['estimated_duration_seconds'], 180)
+        self.assertEqual(status['elapsed_seconds'], 60)
+
+    def test_queued_status_ignores_predicted_start(self):
+        self.queued()
+        with patch('transcriber.slurm.call_slurm', return_value=f'123|{self.name}|PENDING|2026-11-04T12:00:00\n'):
+            reconcile(self.record)
+        status = transcription_status(self.record)
+        self.assertEqual(status['job_state'], 'queued')
+        self.assertIsNone(status['slurm_started_at'])
+        self.assertIsNone(status['elapsed_seconds'])
+
+    def test_accounting_start_survives_reload_and_elapsed_stops_at_finish(self):
+        from datetime import datetime, timezone
+        self.queued()
+        with patch('transcriber.slurm.call_slurm', side_effect=[
+            '', f'123|{self.name}|FAILED|1:0|2026-11-03T12:00:00\n',
+        ]), patch('transcriber.slurm.timezone.now', return_value=datetime(2026, 11, 3, 12, 2, tzinfo=timezone.utc)):
+            reconcile(self.record)
+        reloaded = Transcription.objects.get(pk=self.record.pk)
+        status = transcription_status(reloaded)
+        self.assertEqual(status['slurm_started_at'], '2026-11-03T12:00:00+00:00')
+        self.assertEqual(status['elapsed_seconds'], 120)
+        self.assertEqual(status['state'], 'FAILURE')
+
+    def test_unknown_or_malformed_start_does_not_break_reconciliation(self):
+        self.queued()
+        for timestamp in ['Unknown', 'N/A', '2026-99-99T12:00:00']:
+            with self.subTest(timestamp=timestamp), patch('transcriber.slurm.call_slurm',
+                return_value=f'123|{self.name}|RUNNING|{timestamp}\n'):
+                reconcile(self.record)
+            self.assertEqual(self.record.state, 'running')
+            self.assertIsNone(self.record.slurm_started_at)
+
+    @override_settings(ALLOWED_HOSTS=['testserver'])
+    def test_initialization_and_poll_restore_scheduler_metadata(self):
+        self.queued()
+        with patch('transcriber.slurm.call_slurm', return_value=f'123|{self.name}|RUNNING|2026-11-03T12:00:00\n'):
+            initialized = self.client.get('/get-initialization-data/').json()['active_transcription']
+            polled = self.client.get(f'/poll-transcription-status/{self.record.id}/').json()
+        for status in [initialized, polled]:
+            self.assertEqual(status['slurm_job_id'], '123')
+            self.assertEqual(status['slurm_started_at'], '2026-11-03T12:00:00+00:00')
+            self.assertGreaterEqual(status['elapsed_seconds'], 0)
+            self.assertAlmostEqual(status['estimated_duration_seconds'], 5 / 1000000 * 60)
+
+    def test_scheduler_commands_use_utc_timestamps(self):
+        from .slurm import call_slurm
+        with patch('transcriber.slurm.subprocess.run') as run:
+            run.return_value.stdout = ''
+            call_slurm(['squeue'])
+        self.assertEqual(run.call_args.kwargs['env']['TZ'], 'UTC')
+        self.assertEqual(run.call_args.kwargs['env']['SLURM_TIME_FORMAT'], 'standard')
 
     def test_completed_requires_valid_manifest(self):
         self.queued()

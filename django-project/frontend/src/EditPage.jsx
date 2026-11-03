@@ -85,9 +85,6 @@ const EditPage = ({ transcriptionKey, transcriptionData, onBack, onOpenNotes, on
         <div className="edit-page" style={{ animation: 'fadeIn 0.4s ease-out' }}>
             <div className="page-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.5rem' }}>
                 <div style={{ display: 'flex', gap: '0.75rem' }}>
-                    <button className="btn btn-secondary" onClick={onBack}>
-                        ← Back to Dashboard
-                    </button>
                 </div>
                 <h2 style={{ margin: 0, fontSize: '1.5rem' }}>Results: {transcriptionKey}</h2>
             </div>

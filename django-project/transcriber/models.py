@@ -34,6 +34,7 @@ class Transcription(models.Model):
     state = models.CharField(max_length=20, choices=State.choices, default=State.PREPARING)
     active_slot = models.PositiveSmallIntegerField(null=True, default=1, unique=True)
     slurm_job_id = models.CharField(max_length=64, blank=True)
+    slurm_started_at = models.DateTimeField(null=True, blank=True)
     failure_detail = models.TextField(blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
